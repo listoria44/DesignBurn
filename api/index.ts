@@ -11,7 +11,7 @@ import fs from 'fs';
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
@@ -74,14 +74,36 @@ app.post('/api/roast', async (req, res) => {
     console.log(`Taking screenshot of ${url}...`);
     
     // Vercel-specific Puppeteer launch
-    const isVercel = !!process.env.VERCEL;
+    const isVercel = !!process.env.VERCEL || !!process.env.AWS_REGION || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
+    console.log('Environment check:', { isVercel, nodeEnv: process.env.NODE_ENV });
     
-    browser = await puppeteer.launch({
-      args: isVercel ? chromium.args : ['--no-sandbox', '--disable-setuid-sandbox'],
-      defaultViewport: isVercel ? chromium.defaultViewport : { width: 1280, height: 800 },
-      executablePath: isVercel ? await chromium.executablePath() : undefined,
-      headless: isVercel ? chromium.headless : true,
-    });
+    if (isVercel) {
+      console.log('Launching Puppeteer on Vercel/AWS...');
+      try {
+        browser = await puppeteer.launch({
+          args: chromium.args,
+          defaultViewport: chromium.defaultViewport,
+          executablePath: await chromium.executablePath(),
+          headless: chromium.headless,
+        });
+        console.log('Puppeteer launched successfully on Vercel/AWS');
+      } catch (launchError: any) {
+        console.error('Puppeteer launch error on Vercel/AWS:', launchError.message);
+        throw launchError;
+      }
+    } else {
+      console.log('Launching Puppeteer locally...');
+      try {
+        browser = await puppeteer.launch({
+          args: ['--no-sandbox', '--disable-setuid-sandbox'],
+          headless: true,
+        });
+        console.log('Puppeteer launched successfully locally');
+      } catch (launchError: any) {
+        console.error('Puppeteer launch error locally:', launchError.message);
+        throw launchError;
+      }
+    }
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
@@ -206,8 +228,12 @@ app.get('/api/roast/:id', async (req, res) => {
 });
 
 app.get('/api/burn-of-the-day', async (req, res) => {
-  if (!supabase) return res.json(null);
+  if (!supabase) {
+    console.log('Supabase not configured for burn-of-the-day');
+    return res.json(null);
+  }
   try {
+    console.log('Fetching burn of the day...');
     const { data, error } = await supabase
       .from('roasts')
       .select('*')
@@ -215,9 +241,13 @@ app.get('/api/burn-of-the-day', async (req, res) => {
       .limit(1)
       .maybeSingle();
 
-    if (error) throw error;
+    if (error) {
+      console.error('Supabase error in burn-of-the-day:', error.message);
+      throw error;
+    }
     
     if (!data) {
+      console.log('No roasts found, fetching most recent...');
       const { data: recentData } = await supabase
         .from('roasts')
         .select('*')
@@ -230,6 +260,7 @@ app.get('/api/burn-of-the-day', async (req, res) => {
 
     res.json(data);
   } catch (error: any) {
+    console.error('Error in burn-of-the-day route:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -242,8 +273,8 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
       appType: 'spa',
     });
     app.use(vite.middlewares);
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`Server running on http://localhost:${PORT}`);
+    app.listen(Number(PORT), () => {
+      console.log(`Dev server running on http://localhost:${PORT}`);
     });
   }
   startDevServer();
@@ -255,8 +286,8 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`Server running on http://localhost:${PORT}`);
+    app.listen(Number(PORT), () => {
+      console.log(`Production server running on http://localhost:${PORT}`);
     });
   }
 }
