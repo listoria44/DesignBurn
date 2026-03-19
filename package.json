@@ -4,15 +4,16 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx api/index.ts",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "node server.js",
+    "start": "node api/index.js",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
+    "@sparticuz/chromium": "^123.0.1",
     "@supabase/supabase-js": "^2.99.2",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
@@ -23,6 +24,7 @@
     "modern-screenshot": "^4.6.8",
     "motion": "^12.38.0",
     "puppeteer": "^24.39.1",
+    "puppeteer-core": "^24.39.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "vite": "^6.2.0"

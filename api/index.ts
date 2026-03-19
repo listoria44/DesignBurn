@@ -1,22 +1,21 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
 import { GoogleGenAI } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
 
-fs.writeFileSync('env-dump.json', JSON.stringify(process.env, null, 2));
-
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Supabase setup (Optional for local dev if keys are missing)
+// Supabase setup
 const supabaseUrl = process.env.SUPABASE_URL || '';
 const supabaseKey = process.env.SUPABASE_ANON_KEY || '';
 const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
@@ -25,19 +24,11 @@ app.get(['/api/health', '/api/status'], (req, res) => {
   let geminiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
   geminiKey = geminiKey.replace(/^["']|["']$/g, '').trim();
   
-  // DEBUG: Log all env keys to see what's available
-  console.log("Available ENV keys:", Object.keys(process.env).filter(k => k.includes('API') || k.includes('GEMINI')));
-  console.log("GEMINI_API_KEY length:", process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.length : 0);
-  console.log("API_KEY length:", process.env.API_KEY ? process.env.API_KEY.length : 0);
-
   res.json({
     gemini: !!geminiKey && geminiKey !== 'MY_GEMINI_API_KEY' && geminiKey !== 'YOUR_API_KEY',
     supabaseUrl: !!supabaseUrl && supabaseUrl !== 'your_supabase_url',
     supabaseKey: !!supabaseKey && supabaseKey !== 'your_supabase_anon_key',
-    debug: {
-      hasGeminiEnv: !!process.env.GEMINI_API_KEY,
-      hasApiEnv: !!process.env.API_KEY
-    }
+    isVercel: !!process.env.VERCEL
   });
 });
 
@@ -48,20 +39,19 @@ app.post('/api/roast', async (req, res) => {
     return res.status(400).json({ error: 'URL is required' });
   }
 
-  // 0. Check Supabase for existing roast to ensure consistency
   if (supabase) {
     try {
-      const { data: existingRoast, error: fetchError } = await supabase
+      const { data: existingRoast } = await supabase
         .from('roasts')
         .select('*')
         .eq('url', url)
         .single();
       
       if (existingRoast) {
-        console.log(`Found existing roast for ${url}. Returning cached result.`);
         return res.json({ 
           roast: existingRoast.roast_content, 
           screenshot: existingRoast.screenshot,
+          id: existingRoast.id,
           cached: true 
         });
       }
@@ -70,38 +60,29 @@ app.post('/api/roast', async (req, res) => {
     }
   }
 
-  // AI Studio injects the key directly into process.env.API_KEY or process.env.GEMINI_API_KEY
   let apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
-  
-  // If we still don't have it, let's try to proceed anyway. The SDK might pick it up from the environment automatically.
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey === 'YOUR_API_KEY') {
-     console.warn("Warning: API key seems missing or is a placeholder. Attempting to proceed anyway in case the SDK finds it.");
-     // We will pass undefined to GoogleGenAI, which tells it to look for process.env.GEMINI_API_KEY automatically
      apiKey = undefined; 
-     
-     // CRITICAL FIX: If the environment variable itself is the placeholder, delete it so the SDK doesn't use it!
-     if (process.env.GEMINI_API_KEY === 'MY_GEMINI_API_KEY') {
-       delete process.env.GEMINI_API_KEY;
-     }
-     if (process.env.API_KEY === 'MY_GEMINI_API_KEY' || process.env.API_KEY === 'YOUR_API_KEY') {
-       delete process.env.API_KEY;
-     }
   } else {
-     // Strip quotes if the user accidentally included them
      apiKey = apiKey.replace(/^["']|["']$/g, '').trim();
   }
 
   let browser;
   try {
-    // Initialize with the key if we found a valid one, otherwise let the SDK try to find it
     const ai = apiKey ? new GoogleGenAI({ apiKey }) : new GoogleGenAI({});
 
-    // 1. Take Screenshot
     console.log(`Taking screenshot of ${url}...`);
+    
+    // Vercel-specific Puppeteer launch
+    const isVercel = !!process.env.VERCEL;
+    
     browser = await puppeteer.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      headless: true,
+      args: isVercel ? chromium.args : ['--no-sandbox', '--disable-setuid-sandbox'],
+      defaultViewport: isVercel ? chromium.defaultViewport : { width: 1280, height: 800 },
+      executablePath: isVercel ? await chromium.executablePath() : undefined,
+      headless: isVercel ? chromium.headless : true,
     });
+
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
     try {
@@ -115,11 +96,9 @@ app.post('/api/roast', async (req, res) => {
       });
     }
     
-    // Capture screenshot as base64
     const screenshotBase64 = await page.screenshot({ encoding: 'base64', type: 'jpeg', quality: 80 });
     await browser.close();
 
-    // 2. Send to Gemini
     console.log('Sending to Gemini for roasting...');
     const prompt = `You are "DesignBurn", a world-class, hyper-intelligent, and surgically arrogant UI/UX critic with a PhD in digital disappointment. 
     Your mission is to analyze the provided screenshot of a website and deliver a roast that is brutally honest, technically precise, and laced with dark, global humor (think Gordon Ramsay meets Silicon Valley's Erlich Bachman).
@@ -158,145 +137,76 @@ app.post('/api/roast', async (req, res) => {
           },
         ],
       },
-      config: {
-        responseMimeType: 'application/json',
-      },
     });
 
-    const roastContent = JSON.parse(response.text || '{}');
+    const roastText = response.text;
+    const jsonMatch = roastText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error('Gemini did not return valid JSON');
+    }
+    const roastData = JSON.parse(jsonMatch[0]);
+    const fullScreenshot = `data:image/jpeg;base64,${screenshotBase64}`;
 
-    // 3. Save to Supabase (if configured)
-    let savedId = null;
+    let roastId = null;
     if (supabase) {
-      console.log('Saving to Supabase...');
       try {
-        const { data: savedData, error: insertError } = await supabase.from('roasts').insert([
-          {
+        const { data: savedRoast, error: saveError } = await supabase
+          .from('roasts')
+          .insert({
             url,
-            roast_content: roastContent,
-            screenshot: `data:image/jpeg;base64,${screenshotBase64}`
-          },
-        ]).select().single();
-
-        if (insertError) {
-          if (insertError.message?.includes('relation "roasts" does not exist') || 
-              insertError.message?.includes('Could not find the table \'public.roasts\' in the schema cache')) {
-            console.warn('Supabase "roasts" table not found. Skipping save.');
-          } else {
-            console.error('Supabase save error:', insertError);
-          }
-        } else {
-          savedId = savedData?.id;
-        }
-      } catch (dbError) {
-        console.error('Supabase save exception:', dbError);
+            roast_content: roastData,
+            screenshot: fullScreenshot
+          })
+          .select()
+          .single();
+        
+        if (saveError) throw saveError;
+        roastId = savedRoast.id;
+      } catch (err) {
+        console.error('Error saving roast to Supabase:', err);
       }
     }
 
-    res.json({ 
-      roast: roastContent, 
-      screenshot: `data:image/jpeg;base64,${screenshotBase64}`,
-      id: savedId
-    });
-  } catch (error) {
-    console.error('Error processing roast:', error);
+    res.json({ roast: roastData, screenshot: fullScreenshot, id: roastId });
+  } catch (error: any) {
+    console.error('Roast error:', error);
     if (browser) await browser.close();
-    res.status(500).json({ error: 'Failed to roast the landing page. It was too ugly to process.' });
-  }
-});
-
-app.post('/api/waitlist', async (req, res) => {
-  const { email } = req.body;
-
-  if (!email || !email.includes('@')) {
-    return res.status(400).json({ error: 'Valid email is required' });
-  }
-
-  if (!supabase) {
-    return res.status(503).json({ error: 'Database not configured' });
-  }
-
-  try {
-    const { error } = await supabase
-      .from('waitlist')
-      .insert([{ email }]);
-
-    if (error) {
-      if (error.code === '23505') { // Unique violation
-        return res.status(409).json({ error: 'You are already on the list!' });
-      }
-      throw error;
-    }
-
-    res.json({ success: true, message: 'Welcome to the Burn List!' });
-  } catch (err: any) {
-    console.error('Waitlist error:', err.message || err);
-    res.status(500).json({ error: 'Failed to join waitlist' });
+    res.status(500).json({ error: error.message });
   }
 });
 
 app.get('/api/recent-roasts', async (req, res) => {
-  if (!supabase) {
-    return res.json([]);
-  }
-
+  if (!supabase) return res.json([]);
   try {
     const { data, error } = await supabase
       .from('roasts')
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(10);
-
-    if (error) {
-      // If table doesn't exist yet, return empty array instead of 500
-      const isTableMissing = 
-        error.code === 'PGRST116' || 
-        error.message?.includes('relation "roasts" does not exist') ||
-        error.message?.includes('Could not find the table \'public.roasts\' in the schema cache');
-
-      if (isTableMissing) {
-        console.warn('Supabase "roasts" table not found. Returning empty list.');
-        return res.json([]);
-      }
-      throw error;
-    }
-    res.json(data || []);
-  } catch (err: any) {
-    console.error('Failed to fetch recent roasts:', err.message || err);
-    res.status(500).json({ error: 'Failed to fetch recent roasts', details: err.message });
-  }
-});
-
-// Get a specific roast by ID
-app.get('/api/roast/:id', async (req, res) => {
-  if (!supabase) {
-    return res.status(503).json({ error: 'Database not configured' });
-  }
-
-  try {
-    const { id } = req.params;
-    const { data, error } = await supabase
-      .from('roasts')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: 'Roast not found' });
-    }
-
+      .limit(12);
+    if (error) throw error;
     res.json(data);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get Burn of the Day (Lowest score roast)
-app.get('/api/burn-of-the-day', async (req, res) => {
-  if (!supabase) {
-    return res.json(null);
+app.get('/api/roast/:id', async (req, res) => {
+  if (!supabase) return res.status(404).json({ error: 'Supabase not configured' });
+  try {
+    const { data, error } = await supabase
+      .from('roasts')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error: any) {
+    res.status(404).json({ error: 'Roast not found' });
   }
+});
 
+app.get('/api/burn-of-the-day', async (req, res) => {
+  if (!supabase) return res.json(null);
   try {
     const { data, error } = await supabase
       .from('roasts')
@@ -308,7 +218,6 @@ app.get('/api/burn-of-the-day', async (req, res) => {
     if (error) throw error;
     
     if (!data) {
-      // Fallback to most recent if no "worst" found
       const { data: recentData } = await supabase
         .from('roasts')
         .select('*')
@@ -321,29 +230,35 @@ app.get('/api/burn-of-the-day', async (req, res) => {
 
     res.json(data);
   } catch (error: any) {
-    console.error('Burn of the day error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
+// For local development
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+  async function startDevServer() {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  }
+  startDevServer();
+} else {
+  // In production (non-Vercel), serve static files
+  if (!process.env.VERCEL) {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
   }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
 }
 
-startServer();
+export default app;
